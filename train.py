@@ -54,6 +54,12 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# MoE
+use_MoE = False 
+alpha_balance_loss = -1
+n_exp = 8
+n_exp_per_token = 2
+router_jitter_noise = -1.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -145,7 +151,10 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, 
+                  # MoE
+                  use_MoE=use_MoE, alpha_balance_loss = alpha_balance_loss, n_exp = n_exp, 
+                  n_exp_per_token = n_exp_per_token, router_jitter_noise = router_jitter_noise) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -297,7 +306,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            if model.config.alpha_balance_loss > 0:
+                logits, loss, balance_loss = model(X, Y)
+            else:
+                logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -324,7 +336,10 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if model.config.alpha_balance_loss > 0:
+            print(f"iter {iter_num}: loss {lossf:.4f}, balance loss {balance_loss.item() * gradient_accumulation_steps:.4f} {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        else:    
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

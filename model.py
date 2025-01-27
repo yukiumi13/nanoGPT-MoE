@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from moe_modules.moe import MoELayer, balancing_loss_func
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -104,6 +106,27 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+    
+class MoEBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.moe = MoELayer(config)
+
+    def forward(self, x):
+        
+        # Self Attention
+        x = x + self.attn(self.ln_1(x))
+
+        # FC w/ Experts
+        residual = x
+        x, logits_exps = self.moe(self.ln_2(x))
+        x = residual+ x
+        
+        return x, logits_exps
 
 @dataclass
 class GPTConfig:
@@ -114,6 +137,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # For MoE
+    use_MoE: bool = False 
+    alpha_balance_loss: float = -1
+    n_exp:int = 8
+    n_exp_per_token:int = 2
+    router_jitter_noise: float = -1.0
 
 class GPT(nn.Module):
 
@@ -127,7 +156,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([MoEBlock(config) for _ in range(config.n_layer)]) if config.use_MoE else nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -143,7 +172,15 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
+        
+        print(f"MoE Setting:\n",
+                f"{self.config.use_MoE=}\n", 
+                f"{self.config.alpha_balance_loss=}\n",
+                f"{self.config.n_exp=}\n",
+                f"{self.config.n_exp_per_token=}\n",
+                f"{self.config.router_jitter_noise=}\n")
+        
+        
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -177,20 +214,36 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        
+        # For MoE Logits Loss
+        all_router_logits = () if self.config.alpha_balance_loss > 0 else None
+        
         for block in self.transformer.h:
-            x = block(x)
+            if isinstance(block, Block):
+                x = block(x)
+            elif isinstance(block, MoEBlock):
+                x, logits_exps = block(x)
+                if self.config.alpha_balance_loss > 0:
+                    all_router_logits += (logits_exps,)
+            else:
+                raise NotImplementedError
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            if self.config.alpha_balance_loss > 0 and self.training: # Only cal during training
+                aux_loss =self.config.alpha_balance_loss * balancing_loss_func(all_router_logits=all_router_logits, n_exp= self.config.n_exp, n_exp_per_token= self.config.n_exp_per_token)
+                loss = loss + aux_loss 
+                return logits, loss, aux_loss
+            return logits, loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-        return logits, loss
+            return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -328,3 +381,4 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
