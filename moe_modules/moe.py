@@ -42,7 +42,7 @@ class Top2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ffn_dim = 4 * config.n_embd
-        self.hidden_dim = config.config.n_embd
+        self.hidden_dim = config.n_embd
 
         self.w1 = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
         self.w2 = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
