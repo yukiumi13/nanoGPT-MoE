@@ -84,7 +84,7 @@ class MoELayer(nn.Module):
         self.n_exp = config.n_exp
         
         # Set up experts
-        self.exps = nn.ModuleList([MLP(config) for _ in range(config.n_exp)])
+        self.exps = nn.ModuleList([Top2MLP(config) for _ in range(config.n_exp)])
         
         # Set up router
         self.router = Router(embed_dim = self.embed_dim, n_exp = self.n_exp)
